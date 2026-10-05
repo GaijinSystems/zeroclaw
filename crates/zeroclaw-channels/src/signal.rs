@@ -1,4 +1,6 @@
+use anyhow::Context as _;
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use lru::LruCache;
 use parking_lot::Mutex as SyncMutex;
@@ -6,6 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -13,10 +16,25 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::media::{MarkerKind, MediaAttachment, RenderedMarker};
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
 const RECENT_TARGETS_CAPACITY: usize = 1024;
+
+/// Signal's own per-attachment limit (`global.attachments.maxBytes`, 100 MiB).
+/// Signal measures it after padding and encryption, so signal-cli can still
+/// reject a file slightly under this on send.
+const SIGNAL_MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Workspace subdirectory that inbound attachments are saved into.
+const SIGNAL_ATTACHMENT_SAVE_SUBDIR: &str = "signal_files";
+
+/// Outbound marker kinds sent as signal-cli attachments. `LOCATION` is left
+/// out on purpose: Signal has no location message, so it stays as text.
+const SIGNAL_OUTBOUND_MARKER_KINDS: &[&str] = &[
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
@@ -59,6 +77,10 @@ pub struct SignalChannel {
     /// sender (E.164 phone number or UUID) in `ChannelMessage.id`. Bounded
     /// LRU; once a message ages out, reactions against it fail cleanly.
     recent_targets: Arc<SyncMutex<LruCache<String, ReactionTarget>>>,
+    /// Workspace that inbound attachments are saved into and that outbound
+    /// media markers must resolve inside. `None` disables both: inbound
+    /// attachments arrive as bytes only and outbound markers are refused.
+    workspace_dir: Option<PathBuf>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -110,6 +132,20 @@ struct DataMessage {
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
+}
+
+/// One entry of `dataMessage.attachments`, matching signal-cli's
+/// `JsonAttachment`. `id` is the handle `getAttachment` takes.
+#[derive(Debug, Deserialize)]
+struct SignalAttachment {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "contentType", default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 /// Inbound poll-vote payload.
@@ -164,6 +200,7 @@ impl SignalChannel {
                 NonZeroUsize::new(RECENT_TARGETS_CAPACITY)
                     .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
             ))),
+            workspace_dir: None,
         }
     }
 
@@ -181,6 +218,13 @@ impl SignalChannel {
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
+        self
+    }
+
+    /// Set the workspace used for inbound attachment storage and as the
+    /// boundary for outbound media markers.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -375,12 +419,13 @@ impl SignalChannel {
         let url = format!("{}/api/v1/rpc", self.http_url);
         let id = Uuid::new_v4().to_string();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
-            "params": params,
             "id": id,
         });
+        // Moved in: `json!` would deep-copy params, including attachment data.
+        body["params"] = params;
 
         let resp = self
             .http_client()
@@ -396,22 +441,33 @@ impl SignalChannel {
             return Ok(None);
         }
 
-        let text = resp.text().await?;
-        if text.is_empty() {
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() {
             return Ok(None);
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&text)?;
+        let mut parsed: serde_json::Value = serde_json::from_slice(&bytes)?;
         if let Some(err) = parsed.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             let msg = err
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown");
+            let msg = redact_data_uris(msg);
             anyhow::bail!("Signal RPC error {code}: {msg}");
         }
 
-        Ok(parsed.get("result").cloned())
+        Ok(parsed.get_mut("result").map(serde_json::Value::take))
+    }
+
+    /// Attachment entries to fetch for `data_msg`: none for poll votes or when
+    /// `ignore_attachments` is set.
+    fn inbound_attachment_entries<'a>(&self, data_msg: &'a DataMessage) -> &'a [serde_json::Value] {
+        let is_poll = data_msg.poll_answer.is_some() || data_msg.poll_vote.is_some();
+        if self.ignore_attachments || is_poll {
+            return &[];
+        }
+        data_msg.attachments.as_deref().unwrap_or_default()
     }
 
     /// Process a single SSE envelope, returning one or more
@@ -441,18 +497,6 @@ impl SignalChannel {
         let Some(data_msg) = envelope.data_message.as_ref() else {
             return Vec::new();
         };
-
-        // Skip attachment-only messages when configured
-        if self.ignore_attachments {
-            let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            if has_attachments
-                && data_msg.message.is_none()
-                && data_msg.poll_answer.is_none()
-                && data_msg.poll_vote.is_none()
-            {
-                return Vec::new();
-            }
-        }
 
         let Some(sender) = Self::sender(envelope) else {
             ::zeroclaw_log::record!(
@@ -509,12 +553,16 @@ impl SignalChannel {
                 Vec::new()
             }
         } else {
-            data_msg
-                .message
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .map(|t| vec![t.to_string()])
-                .unwrap_or_default()
+            match data_msg.message.as_deref().filter(|t| !t.is_empty()) {
+                Some(text) => vec![text.to_string()],
+                // Attachment-only message: emit one empty-bodied entry that
+                // `attach_inbound_media` fills in after this sender check.
+                // With `ignore_attachments` there are no entries, so it drops.
+                None if !self.inbound_attachment_entries(data_msg).is_empty() => {
+                    vec![String::new()]
+                }
+                None => Vec::new(),
+            }
         };
         contents
             .into_iter()
@@ -560,6 +608,237 @@ impl SignalChannel {
             .collect()
     }
 
+    /// Download, save, and mark up the attachments on an inbound message that
+    /// already passed the sender and group checks in
+    /// [`Self::process_envelope`]. An attachment that fails is logged and
+    /// skipped; the message text is never lost. Returns `None` only when an
+    /// attachment-only message ends up with nothing to deliver.
+    async fn attach_inbound_media(
+        &self,
+        mut msg: ChannelMessage,
+        envelope: &Envelope,
+    ) -> Option<ChannelMessage> {
+        let Some(data_msg) = envelope.data_message.as_ref() else {
+            return Some(msg);
+        };
+        let group_id = data_msg
+            .group_info
+            .as_ref()
+            .and_then(|g| g.group_id.as_deref());
+
+        for entry in self.inbound_attachment_entries(data_msg) {
+            let fetched = self
+                .fetch_inbound_attachment(entry, &msg.sender, group_id)
+                .await;
+            match fetched {
+                Ok(media) => {
+                    if let Some(marker) = &media.marker {
+                        if !msg.content.is_empty() {
+                            msg.content.push('\n');
+                        }
+                        let label = marker_label(marker.kind);
+                        msg.content
+                            .push_str(&format!("[{label}:{}]", marker.target));
+                    }
+                    msg.attachments.push(media);
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_runtime::security::scrub(&format!("{e:#}")),
+                            })),
+                        "signal: skipping inbound attachment"
+                    );
+                }
+            }
+        }
+
+        if msg.content.is_empty() && msg.attachments.is_empty() {
+            return None;
+        }
+        Some(msg)
+    }
+
+    /// Fetch one inbound attachment through signal-cli's `getAttachment`,
+    /// classify it, and save it into the workspace when one is configured.
+    async fn fetch_inbound_attachment(
+        &self,
+        entry: &serde_json::Value,
+        sender: &str,
+        group_id: Option<&str>,
+    ) -> anyhow::Result<MediaAttachment> {
+        let att =
+            SignalAttachment::deserialize(entry).context("unrecognized attachment metadata")?;
+        let id = att
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::Error::msg("attachment has no id"))?;
+        if att
+            .size
+            .is_some_and(|size| size > SIGNAL_MAX_ATTACHMENT_BYTES)
+        {
+            anyhow::bail!("attachment exceeds the {SIGNAL_MAX_ATTACHMENT_BYTES}-byte limit");
+        }
+
+        let mut params = serde_json::json!({ "account": &self.account, "id": id });
+        match group_id {
+            Some(group_id) => params["groupId"] = serde_json::json!(group_id),
+            None => params["recipient"] = serde_json::json!(sender),
+        }
+        let result = self
+            .rpc_request("getAttachment", params)
+            .await?
+            .ok_or_else(|| anyhow::Error::msg("getAttachment returned no result"))?;
+        let encoded = result
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::Error::msg("getAttachment result has no data"))?;
+        let data = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        if data.len() as u64 > SIGNAL_MAX_ATTACHMENT_BYTES {
+            anyhow::bail!("attachment exceeds the {SIGNAL_MAX_ATTACHMENT_BYTES}-byte limit");
+        }
+
+        // Keep only the final path component of the sender-supplied name.
+        let file_name = Path::new(att.filename.as_deref().unwrap_or_default())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("attachment")
+            .to_string();
+        let content_type = att.content_type.as_deref().filter(|ct| !ct.is_empty());
+        let kind = inbound_marker_kind(content_type.unwrap_or_default(), &file_name, &data);
+
+        let marker = match self.workspace_dir.as_deref() {
+            Some(workspace) => save_inbound_attachment(workspace, &file_name, &data)
+                .await
+                .inspect_err(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": zeroclaw_runtime::security::scrub(&format!("{e:#}")),
+                            })),
+                        "signal: inbound attachment save failed; passing bytes only"
+                    );
+                })
+                .ok()
+                .map(|path| RenderedMarker {
+                    target: path.display().to_string(),
+                    kind,
+                }),
+            None => None,
+        };
+
+        Ok(MediaAttachment {
+            file_name,
+            data,
+            mime_type: content_type.map(str::to_owned),
+            marker,
+        })
+    }
+
+    /// Split outbound media markers out of `content`. Resolved markers become
+    /// signal-cli attachments; unresolved ones are dropped, logged, and
+    /// summarized in a count-only note. Content without markers is returned
+    /// unchanged.
+    async fn prepare_outbound(&self, content: &str) -> (String, Vec<String>) {
+        let (cleaned, markers) =
+            crate::util::parse_attachment_markers_of_kinds(content, SIGNAL_OUTBOUND_MARKER_KINDS);
+        if markers.is_empty() {
+            return (content.to_string(), Vec::new());
+        }
+
+        let mut text = cleaned;
+        let mut attachments = Vec::new();
+        let mut failed = 0usize;
+        for (kind, target) in &markers {
+            match self.resolve_outbound_marker(target).await {
+                Ok(attachment) => attachments.push(attachment),
+                Err(err) => {
+                    failed += 1;
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "kind": kind,
+                                "outcome": err.outcome(),
+                                "reason": err.reason(),
+                            })),
+                        "signal: dropping unresolved outbound attachment marker"
+                    );
+                }
+            }
+        }
+
+        if let Some(note) = signal_delivery_failure_note(failed) {
+            if text.is_empty() {
+                text = note;
+            } else {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
+        }
+        (text, attachments)
+    }
+
+    /// Resolve an outbound marker target into a signal-cli attachment. Only
+    /// regular files inside the workspace are accepted, and they are sent as
+    /// RFC 2397 data URIs so delivery works even when signal-cli does not
+    /// share ZeroClaw's filesystem.
+    async fn resolve_outbound_marker(&self, target: &str) -> Result<String, SignalMarkerError> {
+        let target = target.trim();
+        if target.contains("://") || target.starts_with("data:") || target.starts_with("file:") {
+            return Err(SignalMarkerError::Refused("scheme"));
+        }
+        let workspace = self
+            .workspace_dir
+            .as_deref()
+            .ok_or(SignalMarkerError::Refused("no_workspace"))?;
+        let workspace = tokio::fs::canonicalize(workspace)
+            .await
+            .map_err(|_| SignalMarkerError::Refused("no_workspace"))?;
+
+        // `join` keeps an absolute target as-is and anchors a relative one in
+        // the workspace; canonicalizing then resolves `..` and symlinks.
+        let path = match tokio::fs::canonicalize(workspace.join(target)).await {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SignalMarkerError::Failed("not_found"));
+            }
+            Err(_) => return Err(SignalMarkerError::Failed("read_error")),
+        };
+        if !path.starts_with(&workspace) {
+            return Err(SignalMarkerError::Refused("outside_workspace"));
+        }
+
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|_| SignalMarkerError::Failed("read_error"))?;
+        if !metadata.is_file() {
+            return Err(SignalMarkerError::Failed("not_a_file"));
+        }
+        if metadata.len() > SIGNAL_MAX_ATTACHMENT_BYTES {
+            return Err(SignalMarkerError::Failed("too_large"));
+        }
+        let data = tokio::fs::read(&path)
+            .await
+            .map_err(|_| SignalMarkerError::Failed("read_error"))?;
+
+        let mime = mime_guess::from_path(&path)
+            .first_raw()
+            .or_else(|| zeroclaw_api::media::image_mime_from_magic(&data))
+            .unwrap_or("application/octet-stream");
+        let mut uri = format!("data:{mime};filename={};base64,", data_uri_file_name(&path));
+        base64::engine::general_purpose::STANDARD.encode_string(&data, &mut uri);
+        Ok(uri)
+    }
+
     /// Send a multiple-choice poll to `recipient` (E.164 number, UUID,
     /// or `group:<id>`).
     ///
@@ -590,6 +869,143 @@ impl SignalChannel {
         self.rpc_request("sendPollCreate", params).await?;
         Ok(())
     }
+}
+
+/// Why an outbound media marker was not attached. Neither variant carries the
+/// target, so logging one cannot leak a local path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalMarkerError {
+    /// Trust-boundary refusal: the target was never read.
+    Refused(&'static str),
+    /// Allowed, but the file could not be delivered.
+    Failed(&'static str),
+}
+
+impl SignalMarkerError {
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Refused(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
+/// Pick the marker disposition for an inbound attachment. An `image/*`
+/// payload is only an image when the provider loader accepts it; otherwise it
+/// renders as a document so the shared pipeline never re-inlines bytes the
+/// provider rejects (the same rule as Discord's `marker_kind_for`).
+fn inbound_marker_kind(content_type: &str, file_name: &str, data: &[u8]) -> MarkerKind {
+    if content_type.starts_with("image/") {
+        if zeroclaw_api::media::provider_loadable_image_mime_for(file_name, data).is_some() {
+            MarkerKind::Image
+        } else {
+            MarkerKind::Document
+        }
+    } else if content_type.starts_with("audio/") {
+        MarkerKind::Audio
+    } else if content_type.starts_with("video/") {
+        MarkerKind::Video
+    } else {
+        MarkerKind::Document
+    }
+}
+
+/// The `[KIND:target]` label rendered for a disposition.
+fn marker_label(kind: MarkerKind) -> &'static str {
+    match kind {
+        MarkerKind::Image => "IMAGE",
+        MarkerKind::Audio => "AUDIO",
+        MarkerKind::Video => "VIDEO",
+        MarkerKind::Document => "DOCUMENT",
+    }
+}
+
+/// Write inbound attachment bytes under the workspace. `file_name` must
+/// already be a bare file name; the UUID prefix keeps repeated names (and the
+/// common nameless `attachment`) from overwriting each other.
+async fn save_inbound_attachment(
+    workspace: &Path,
+    file_name: &str,
+    data: &[u8],
+) -> anyhow::Result<PathBuf> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let dir = workspace.join(SIGNAL_ATTACHMENT_SAVE_SUBDIR);
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir.join(format!("{}_{file_name}", Uuid::new_v4()));
+    // Streamed through tokio's bounded write buffer; `tokio::fs::write` would
+    // first copy the whole payload.
+    let mut file = tokio::fs::File::create(&path).await?;
+    file.write_all(data).await?;
+    file.flush().await?;
+    Ok(path)
+}
+
+/// File name for a signal-cli data URI, limited to characters that cannot be
+/// confused with data-URI syntax.
+fn data_uri_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// signal-cli echoes a rejected attachment argument in its error text. For a
+/// data URI that argument is the whole file, so each URI is replaced before
+/// the error can reach a log.
+fn redact_data_uris(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(512));
+    let mut rest = text;
+    while let Some(start) = rest.find("data:") {
+        let at_token_start = rest[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        let (head, tail) = rest.split_at(start);
+        out.push_str(head);
+        if at_token_start {
+            out.push_str("data:<redacted>");
+            let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+            rest = &tail[end..];
+        } else {
+            out.push_str("data:");
+            rest = &tail["data:".len()..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Count-only notice appended when outbound media markers could not be
+/// delivered. Targets and reasons stay in the log.
+fn signal_delivery_failure_note(failure_count: usize) -> Option<String> {
+    if failure_count == 0 {
+        return None;
+    }
+    let count = failure_count.to_string();
+    let key = if failure_count == 1 {
+        "channel-signal-delivery-failure-note-one"
+    } else {
+        "channel-signal-delivery-failure-note-many"
+    };
+    Some(zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SignalChannel {
@@ -626,18 +1042,22 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(&message.recipient) {
+        let (text, attachments) = self.prepare_outbound(&message.content).await;
+        let mut params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
-                "message": &message.content,
+                "message": text,
                 "account": &self.account,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "groupId": group_id,
-                "message": &message.content,
+                "message": text,
                 "account": &self.account,
             }),
         };
+        if !attachments.is_empty() {
+            params["attachments"] = serde_json::Value::from(attachments);
+        }
 
         self.rpc_request("send", params).await?;
         Ok(())
@@ -814,6 +1234,11 @@ impl Channel for SignalChannel {
                                                 consumed_as_approval = true;
                                                 continue;
                                             }
+                                            let Some(msg) =
+                                                self.attach_inbound_media(msg, envelope).await
+                                            else {
+                                                continue;
+                                            };
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
@@ -863,6 +1288,10 @@ impl Channel for SignalChannel {
                                 {
                                     continue;
                                 }
+                                let Some(msg) = self.attach_inbound_media(msg, envelope).await
+                                else {
+                                    continue;
+                                };
                                 let _ = tx.send(msg).await;
                             }
                         }
@@ -1022,6 +1451,8 @@ impl Channel for SignalChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
         Envelope {
@@ -2392,5 +2823,543 @@ mod tests {
         // PollAnswer present but both vecs empty (signal-cli weirdness).
         let env = poll_envelope(Some("+1111111111"), vec![], vec![]);
         assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    // ── media attachments ───────────────────────────────────────
+
+    /// PNG signature plus padding: enough for the provider loader to accept.
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\0";
+
+    fn b64(data: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
+    }
+
+    fn media_channel(http_url: &str, ignore_attachments: bool) -> SignalChannel {
+        SignalChannel::new(
+            http_url.to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            ignore_attachments,
+            false,
+        )
+    }
+
+    fn attachment_envelope(
+        message: Option<&str>,
+        group_id: Option<&str>,
+        attachments: Vec<serde_json::Value>,
+    ) -> Envelope {
+        Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
+            data_message: Some(DataMessage {
+                message: message.map(String::from),
+                timestamp: Some(1_700_000_000_000),
+                group_info: group_id.map(|id| GroupInfo {
+                    group_id: Some(id.to_string()),
+                }),
+                attachments: Some(attachments),
+                poll_answer: None,
+                poll_vote: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        }
+    }
+
+    fn rpc_method(name: &str) -> wiremock::MockBuilder {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .and(body_partial_json(serde_json::json!({ "method": name })))
+    }
+
+    fn rpc_result(result: serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": "1",
+        }))
+    }
+
+    fn attachment_data(data: &[u8]) -> ResponseTemplate {
+        rpc_result(serde_json::json!({ "data": b64(data) }))
+    }
+
+    /// A mock signal-cli that accepts `send`.
+    async fn send_server() -> MockServer {
+        let server = MockServer::start().await;
+        rpc_method("send")
+            .respond_with(rpc_result(serde_json::json!({ "timestamp": 1 })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A mock signal-cli whose `getAttachment` answers with `response` and
+    /// must be called exactly `calls` times.
+    async fn attachment_server(response: ResponseTemplate, calls: u64) -> MockServer {
+        let server = MockServer::start().await;
+        rpc_method("getAttachment")
+            .respond_with(response)
+            .expect(calls)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Params of every recorded call to the given signal-cli method.
+    async fn rpc_params(server: &MockServer, name: &str) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .filter(|body| body["method"] == name)
+            .map(|body| body["params"].clone())
+            .collect()
+    }
+
+    async fn send_and_capture(
+        ch: &SignalChannel,
+        server: &MockServer,
+        msg: SendMessage,
+    ) -> serde_json::Value {
+        ch.send(&msg).await.expect("send succeeds");
+        let mut sent = rpc_params(server, "send").await;
+        assert_eq!(sent.len(), 1, "exactly one send call");
+        sent.remove(0)
+    }
+
+    /// The inbound steps `listen` runs for a single-message envelope.
+    async fn receive(ch: &SignalChannel, env: &Envelope) -> Option<ChannelMessage> {
+        let msg = ch.process_envelope(env).pop().expect("message emitted");
+        ch.attach_inbound_media(msg, env).await
+    }
+
+    #[tokio::test]
+    async fn send_attaches_workspace_marker_as_data_uri() {
+        let server = send_server().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("photo.png"), PNG_BYTES).unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+
+        let msg = SendMessage::new("Here it is [IMAGE:photo.png]", "+1111111111");
+        let params = send_and_capture(&ch, &server, msg).await;
+
+        assert_eq!(params["recipient"], serde_json::json!(["+1111111111"]));
+        assert_eq!(params["message"], "Here it is");
+        let expected = format!(
+            "data:image/png;filename=photo.png;base64,{}",
+            b64(PNG_BYTES)
+        );
+        assert_eq!(params["attachments"], serde_json::json!([expected]));
+    }
+
+    #[tokio::test]
+    async fn send_attaches_absolute_workspace_path_for_group_recipient() {
+        let server = send_server().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("notes.pdf");
+        std::fs::write(&file, b"%PDF-1.4").unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+
+        let msg = SendMessage::new(format!("[DOCUMENT:{}]", file.display()), "group:grp123");
+        let params = send_and_capture(&ch, &server, msg).await;
+
+        assert_eq!(params["groupId"], "grp123");
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["message"], "");
+        let attachment = params["attachments"][0].as_str().expect("one attachment");
+        assert!(
+            attachment.starts_with("data:application/pdf;filename=notes.pdf;base64,"),
+            "{attachment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_drops_unresolved_markers_and_appends_count_note() {
+        let server = send_server().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside_path = outside.path().display().to_string();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+
+        let content = format!(
+            "Report [DOCUMENT:{outside_path}] [IMAGE:missing.png] [IMAGE:https://example.com/a.png]"
+        );
+        let params = send_and_capture(&ch, &server, SendMessage::new(content, "+1111111111")).await;
+
+        let message = params["message"].as_str().expect("message text");
+        assert!(message.starts_with("Report"), "{message}");
+        assert!(
+            message.contains('3'),
+            "note must carry the failure count: {message}"
+        );
+        for leaked in [outside_path.as_str(), "missing.png", "example.com"] {
+            assert!(
+                !message.contains(leaked),
+                "target leaked into reply: {message}"
+            );
+        }
+        assert!(params.get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_with_only_failed_markers_sends_the_note_alone() {
+        let server = send_server().await;
+        let ch = media_channel(&server.uri(), false);
+
+        let msg = SendMessage::new("[IMAGE:photo.png]", "+1111111111");
+        let params = send_and_capture(&ch, &server, msg).await;
+
+        assert_eq!(
+            params["message"],
+            signal_delivery_failure_note(1).expect("note")
+        );
+        assert!(params.get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_without_media_markers_keeps_text_verbatim() {
+        let server = send_server().await;
+        let ch = media_channel(&server.uri(), false);
+
+        let text = "  meet here [LOCATION:40.7,-74.0] later  ";
+        let params = send_and_capture(&ch, &server, SendMessage::new(text, "+1111111111")).await;
+
+        assert_eq!(params["message"], text);
+        assert!(params.get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn outbound_marker_refuses_urls_and_missing_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel("http://127.0.0.1:1", false);
+        assert_eq!(
+            ch.resolve_outbound_marker("photo.png").await,
+            Err(SignalMarkerError::Refused("no_workspace"))
+        );
+
+        let ch = ch.with_workspace_dir(workspace.path().into());
+        for target in [
+            "https://example.com/a.png",
+            "http://example.com/a.png",
+            "data:image/png;base64,AAAA",
+            "file:///etc/hostname",
+        ] {
+            assert_eq!(
+                ch.resolve_outbound_marker(target).await,
+                Err(SignalMarkerError::Refused("scheme")),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_marker_refuses_paths_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+        // Both temp entries share the system temp dir, so `sub/../../<name>`
+        // climbs out of the workspace and lands on the outside file.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside_name = outside.path().file_name().unwrap().to_str().unwrap();
+        let ch =
+            media_channel("http://127.0.0.1:1", false).with_workspace_dir(workspace.path().into());
+
+        for target in [
+            outside.path().display().to_string(),
+            format!("sub/../../{outside_name}"),
+        ] {
+            assert_eq!(
+                ch.resolve_outbound_marker(&target).await,
+                Err(SignalMarkerError::Refused("outside_workspace")),
+                "{target}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outbound_marker_refuses_symlink_escaping_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("link.txt")).unwrap();
+        let ch =
+            media_channel("http://127.0.0.1:1", false).with_workspace_dir(workspace.path().into());
+
+        assert_eq!(
+            ch.resolve_outbound_marker("link.txt").await,
+            Err(SignalMarkerError::Refused("outside_workspace"))
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_marker_reports_missing_directory_and_oversized_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("folder")).unwrap();
+        let big = std::fs::File::create(workspace.path().join("big.bin")).unwrap();
+        big.set_len(SIGNAL_MAX_ATTACHMENT_BYTES + 1).unwrap();
+        let ch =
+            media_channel("http://127.0.0.1:1", false).with_workspace_dir(workspace.path().into());
+
+        for (target, reason) in [
+            ("missing.png", "not_found"),
+            ("folder", "not_a_file"),
+            ("big.bin", "too_large"),
+        ] {
+            assert_eq!(
+                ch.resolve_outbound_marker(target).await,
+                Err(SignalMarkerError::Failed(reason)),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_failure_note_is_count_only() {
+        assert!(signal_delivery_failure_note(0).is_none());
+        for count in [1usize, 2] {
+            let note = signal_delivery_failure_note(count).expect("note");
+            // Locale-independent: every catalog renders `{$count}` as digits.
+            assert!(note.contains(&count.to_string()), "{note}");
+            // A missing Fluent key renders as `{key}`.
+            assert!(!note.starts_with('{'), "missing Fluent key: {note}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_image_is_saved_and_marked() {
+        let server = attachment_server(attachment_data(PNG_BYTES), 1).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            Some("look"),
+            None,
+            vec![serde_json::json!({
+                "id": "att1",
+                "contentType": "image/png",
+                "filename": "cat.png",
+                "size": PNG_BYTES.len(),
+            })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.attachments.len(), 1);
+        let attachment = &msg.attachments[0];
+        assert_eq!(attachment.data, PNG_BYTES);
+        let marker = attachment.marker.as_ref().expect("rendered marker");
+        assert_eq!(marker.kind, MarkerKind::Image);
+        let saved = Path::new(&marker.target);
+        assert!(saved.starts_with(workspace.path().join(SIGNAL_ATTACHMENT_SAVE_SUBDIR)));
+        assert_eq!(std::fs::read(saved).unwrap(), PNG_BYTES);
+        assert_eq!(msg.content, format!("look\n[IMAGE:{}]", marker.target));
+
+        let downloads = rpc_params(&server, "getAttachment").await;
+        assert_eq!(downloads[0]["id"], "att1");
+        assert_eq!(downloads[0]["recipient"], "+1111111111");
+        assert!(downloads[0].get("groupId").is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_attachment_only_group_document_is_delivered() {
+        let server = attachment_server(attachment_data(b"%PDF-1.4"), 1).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            None,
+            Some("grp123"),
+            vec![serde_json::json!({
+                "id": "att2",
+                "contentType": "application/pdf",
+                "filename": "../../etc/report.pdf",
+            })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        let marker = msg.attachments[0].marker.as_ref().expect("rendered marker");
+        assert_eq!(marker.kind, MarkerKind::Document);
+        assert_eq!(msg.content, format!("[DOCUMENT:{}]", marker.target));
+        let saved = Path::new(&marker.target);
+        let save_dir = workspace.path().join(SIGNAL_ATTACHMENT_SAVE_SUBDIR);
+        assert_eq!(saved.parent(), Some(save_dir.as_path()));
+        let saved_name = saved.file_name().unwrap().to_str().unwrap();
+        assert!(saved_name.ends_with("_report.pdf"), "{saved_name}");
+
+        let downloads = rpc_params(&server, "getAttachment").await;
+        assert_eq!(downloads[0]["groupId"], "grp123");
+        assert!(downloads[0].get("recipient").is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_attachments_are_not_downloaded_when_ignored() {
+        let server = attachment_server(attachment_data(PNG_BYTES), 0).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), true).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            Some("caption"),
+            None,
+            vec![serde_json::json!({ "id": "att1", "contentType": "image/png" })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.content, "caption");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_without_workspace_passes_bytes_without_marker() {
+        let server = attachment_server(attachment_data(PNG_BYTES), 1).await;
+        let ch = media_channel(&server.uri(), false);
+        let env = attachment_envelope(
+            Some("hi"),
+            None,
+            vec![serde_json::json!({ "id": "att1", "contentType": "image/png" })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.content, "hi");
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].data, PNG_BYTES);
+        assert!(msg.attachments[0].marker.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_download_failure_keeps_text_and_drops_empty_message() {
+        let failure = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -1, "message": "attachment unavailable" },
+            "id": "1",
+        }));
+        let server = attachment_server(failure, 2).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let attachment = serde_json::json!({ "id": "att1", "contentType": "image/png" });
+
+        let env = attachment_envelope(Some("caption"), None, vec![attachment.clone()]);
+        let msg = receive(&ch, &env).await.expect("text survives");
+        assert_eq!(msg.content, "caption");
+        assert!(msg.attachments.is_empty());
+
+        let env = attachment_envelope(None, None, vec![attachment]);
+        assert!(receive(&ch, &env).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_oversized_attachment_is_skipped_without_download() {
+        let server = attachment_server(attachment_data(PNG_BYTES), 0).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            Some("big"),
+            None,
+            vec![serde_json::json!({
+                "id": "att1",
+                "contentType": "video/mp4",
+                "size": SIGNAL_MAX_ATTACHMENT_BYTES + 1,
+            })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.content, "big");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[test]
+    fn redact_data_uris_replaces_each_uri_and_keeps_other_text() {
+        let text = "Failed to send message: data:image/png;filename=a.png;base64,iVBORw0KGgo: \
+                    Invalid attachment (AttachmentInvalidException) data:text/plain;base64,QUJD";
+        assert_eq!(
+            redact_data_uris(text),
+            "Failed to send message: data:<redacted> Invalid attachment \
+             (AttachmentInvalidException) data:<redacted>"
+        );
+        assert_eq!(
+            redact_data_uris("bad metadata: field"),
+            "bad metadata: field"
+        );
+        assert_eq!(redact_data_uris("no uri here"), "no uri here");
+    }
+
+    #[tokio::test]
+    async fn send_error_does_not_echo_attachment_contents() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("photo.png"), PNG_BYTES).unwrap();
+        let payload = b64(PNG_BYTES);
+        let server = MockServer::start().await;
+        rpc_method("send")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -1,
+                    "message": format!(
+                        "Failed to send message: data:image/png;filename=photo.png;base64,{payload}: \
+                         too large (AttachmentInvalidException)"
+                    ),
+                },
+                "id": "1",
+            })))
+            .mount(&server)
+            .await;
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+
+        let err = ch
+            .send(&SendMessage::new("[IMAGE:photo.png]", "+1111111111"))
+            .await
+            .expect_err("signal-cli rejected the send");
+
+        let text = format!("{err:#}");
+        assert!(!text.contains(&payload), "attachment data leaked: {text}");
+        assert!(text.contains("data:<redacted>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn inbound_saved_attachment_can_be_sent_back_with_its_marker() {
+        let server = attachment_server(attachment_data(b"%PDF-1.4"), 1).await;
+        rpc_method("send")
+            .respond_with(rpc_result(serde_json::json!({ "timestamp": 1 })))
+            .mount(&server)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            None,
+            None,
+            vec![serde_json::json!({
+                "id": "att3",
+                "contentType": "application/pdf",
+                "filename": "report.pdf",
+            })],
+        );
+        let inbound = receive(&ch, &env).await.expect("delivered");
+        let marker = inbound.attachments[0]
+            .marker
+            .as_ref()
+            .expect("rendered marker");
+        let saved_name = Path::new(&marker.target)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        // The agent copies the inbound marker verbatim into its reply.
+        let reply = format!("Here it is again {}", inbound.content);
+        let params = send_and_capture(&ch, &server, SendMessage::new(reply, "+1111111111")).await;
+
+        assert_eq!(params["message"], "Here it is again");
+        let expected = format!(
+            "data:application/pdf;filename={saved_name};base64,{}",
+            b64(b"%PDF-1.4")
+        );
+        assert_eq!(params["attachments"], serde_json::json!([expected]));
     }
 }
