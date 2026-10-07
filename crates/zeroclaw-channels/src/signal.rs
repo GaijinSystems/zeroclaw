@@ -27,6 +27,15 @@ const RECENT_TARGETS_CAPACITY: usize = 1024;
 /// reject a file slightly under this on send.
 const SIGNAL_MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Combined file bytes of all attachments one message may hold in memory,
+/// inbound or outbound. Fits one maximum-size file. signal-cli exchanges
+/// attachments as base64 inside JSON, so the transfer itself is about 4/3 of
+/// this; response and file reads are capped against that encoded size.
+const SIGNAL_MESSAGE_ATTACHMENT_BUDGET: u64 = SIGNAL_MAX_ATTACHMENT_BYTES;
+
+/// Room for the JSON-RPC envelope around a `getAttachment` payload.
+const SIGNAL_RPC_ENVELOPE_BYTES: u64 = 64 * 1024;
+
 /// Workspace subdirectory that inbound attachments are saved into.
 const SIGNAL_ATTACHMENT_SAVE_SUBDIR: &str = "signal_files";
 
@@ -81,6 +90,9 @@ pub struct SignalChannel {
     /// media markers must resolve inside. `None` disables both: inbound
     /// attachments arrive as bytes only and outbound markers are refused.
     workspace_dir: Option<PathBuf>,
+    /// Per-message attachment budget in file bytes. Always
+    /// [`SIGNAL_MESSAGE_ATTACHMENT_BUDGET`] outside tests.
+    attachment_budget: u64,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -201,6 +213,7 @@ impl SignalChannel {
                     .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
             ))),
             workspace_dir: None,
+            attachment_budget: SIGNAL_MESSAGE_ATTACHMENT_BUDGET,
         }
     }
 
@@ -225,6 +238,12 @@ impl SignalChannel {
     /// boundary for outbound media markers.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_attachment_budget(mut self, bytes: u64) -> Self {
+        self.attachment_budget = bytes;
         self
     }
 
@@ -416,6 +435,17 @@ impl SignalChannel {
         method: &str,
         params: serde_json::Value,
     ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.rpc_request_limited(method, params, None).await
+    }
+
+    /// [`Self::rpc_request`], failing once the response body passes
+    /// `max_response_bytes` instead of buffering all of it first.
+    async fn rpc_request_limited(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        max_response_bytes: Option<u64>,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
         let url = format!("{}/api/v1/rpc", self.http_url);
         let id = Uuid::new_v4().to_string();
 
@@ -441,12 +471,22 @@ impl SignalChannel {
             return Ok(None);
         }
 
-        let bytes = resp.bytes().await?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        let mut parsed: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let mut parsed: serde_json::Value = match max_response_bytes {
+            Some(limit) => {
+                let bytes = read_body_limited(resp, limit).await?;
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                serde_json::from_slice(&bytes)?
+            }
+            None => {
+                let bytes = resp.bytes().await?;
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                serde_json::from_slice(&bytes)?
+            }
+        };
         if let Some(err) = parsed.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             let msg = err
@@ -611,7 +651,9 @@ impl SignalChannel {
     /// Download, save, and mark up the attachments on an inbound message that
     /// already passed the sender and group checks in
     /// [`Self::process_envelope`]. An attachment that fails is logged and
-    /// skipped; the message text is never lost. Returns `None` only when an
+    /// skipped; the message text is never lost. Attachments are held in memory
+    /// until dispatch, so once the message's attachment budget is spent the
+    /// rest are skipped without downloading. Returns `None` only when an
     /// attachment-only message ends up with nothing to deliver.
     async fn attach_inbound_media(
         &self,
@@ -626,12 +668,17 @@ impl SignalChannel {
             .as_ref()
             .and_then(|g| g.group_id.as_deref());
 
+        let mut remaining = self.attachment_budget;
         for entry in self.inbound_attachment_entries(data_msg) {
-            let fetched = self
-                .fetch_inbound_attachment(entry, &msg.sender, group_id)
-                .await;
+            let fetched = if remaining == 0 {
+                Err(anyhow::Error::msg("message attachment budget exhausted"))
+            } else {
+                self.fetch_inbound_attachment(entry, &msg.sender, group_id, remaining)
+                    .await
+            };
             match fetched {
                 Ok(media) => {
+                    remaining = remaining.saturating_sub(media.data.len() as u64);
                     if let Some(marker) = &media.marker {
                         if !msg.content.is_empty() {
                             msg.content.push('\n');
@@ -664,11 +711,14 @@ impl SignalChannel {
 
     /// Fetch one inbound attachment through signal-cli's `getAttachment`,
     /// classify it, and save it into the workspace when one is configured.
+    /// `budget` is what remains of the message's attachment budget; the
+    /// response is capped at that size in base64 before it is buffered.
     async fn fetch_inbound_attachment(
         &self,
         entry: &serde_json::Value,
         sender: &str,
         group_id: Option<&str>,
+        budget: u64,
     ) -> anyhow::Result<MediaAttachment> {
         let att =
             SignalAttachment::deserialize(entry).context("unrecognized attachment metadata")?;
@@ -677,11 +727,9 @@ impl SignalChannel {
             .as_deref()
             .filter(|id| !id.is_empty())
             .ok_or_else(|| anyhow::Error::msg("attachment has no id"))?;
-        if att
-            .size
-            .is_some_and(|size| size > SIGNAL_MAX_ATTACHMENT_BYTES)
-        {
-            anyhow::bail!("attachment exceeds the {SIGNAL_MAX_ATTACHMENT_BYTES}-byte limit");
+        let limit = budget.min(SIGNAL_MAX_ATTACHMENT_BYTES);
+        if att.size.is_some_and(|size| size > limit) {
+            anyhow::bail!("attachment exceeds the {limit}-byte limit");
         }
 
         let mut params = serde_json::json!({ "account": &self.account, "id": id });
@@ -689,8 +737,11 @@ impl SignalChannel {
             Some(group_id) => params["groupId"] = serde_json::json!(group_id),
             None => params["recipient"] = serde_json::json!(sender),
         }
+        // The declared size is the sender's claim; the response cap holds
+        // even when it is missing or wrong.
+        let max_response = base64_len(limit) + SIGNAL_RPC_ENVELOPE_BYTES;
         let result = self
-            .rpc_request("getAttachment", params)
+            .rpc_request_limited("getAttachment", params, Some(max_response))
             .await?
             .ok_or_else(|| anyhow::Error::msg("getAttachment returned no result"))?;
         let encoded = result
@@ -698,8 +749,8 @@ impl SignalChannel {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::Error::msg("getAttachment result has no data"))?;
         let data = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-        if data.len() as u64 > SIGNAL_MAX_ATTACHMENT_BYTES {
-            anyhow::bail!("attachment exceeds the {SIGNAL_MAX_ATTACHMENT_BYTES}-byte limit");
+        if data.len() as u64 > limit {
+            anyhow::bail!("attachment exceeds the {limit}-byte limit");
         }
 
         // Keep only the final path component of the sender-supplied name.
@@ -711,9 +762,12 @@ impl SignalChannel {
             .to_string();
         let content_type = att.content_type.as_deref().filter(|ct| !ct.is_empty());
         let kind = inbound_marker_kind(content_type.unwrap_or_default(), &file_name, &data);
+        // `file_name` stays as sent for display; the saved copy gets a name
+        // its own marker can carry.
+        let stored_name = marker_safe_file_name(&file_name);
 
         let marker = match self.workspace_dir.as_deref() {
-            Some(workspace) => save_inbound_attachment(workspace, &file_name, &data)
+            Some(workspace) => save_inbound_attachment(workspace, &stored_name, &data)
                 .await
                 .inspect_err(|e| {
                     ::zeroclaw_log::record!(
@@ -756,9 +810,15 @@ impl SignalChannel {
         let mut text = cleaned;
         let mut attachments = Vec::new();
         let mut failed = 0usize;
+        // Every encoded file is held until `send` serializes the request, so
+        // the files together must fit the message's attachment budget.
+        let mut remaining = self.attachment_budget;
         for (kind, target) in &markers {
-            match self.resolve_outbound_marker(target).await {
-                Ok(attachment) => attachments.push(attachment),
+            match self.resolve_outbound_marker(target, remaining).await {
+                Ok((attachment, file_len)) => {
+                    remaining = remaining.saturating_sub(file_len);
+                    attachments.push(attachment);
+                }
                 Err(err) => {
                     failed += 1;
                     ::zeroclaw_log::record!(
@@ -790,8 +850,16 @@ impl SignalChannel {
     /// Resolve an outbound marker target into a signal-cli attachment. Only
     /// regular files inside the workspace are accepted, and they are sent as
     /// RFC 2397 data URIs so delivery works even when signal-cli does not
-    /// share ZeroClaw's filesystem.
-    async fn resolve_outbound_marker(&self, target: &str) -> Result<String, SignalMarkerError> {
+    /// share ZeroClaw's filesystem. A file larger than `budget` (what remains
+    /// of the message's attachment budget) is never read. Returns the URI and
+    /// the file's size.
+    async fn resolve_outbound_marker(
+        &self,
+        target: &str,
+        budget: u64,
+    ) -> Result<(String, u64), SignalMarkerError> {
+        use tokio::io::AsyncReadExt as _;
+
         let target = target.trim();
         if target.contains("://") || target.starts_with("data:") || target.starts_with("file:") {
             return Err(SignalMarkerError::Refused("scheme"));
@@ -823,12 +891,31 @@ impl SignalChannel {
         if !metadata.is_file() {
             return Err(SignalMarkerError::Failed("not_a_file"));
         }
-        if metadata.len() > SIGNAL_MAX_ATTACHMENT_BYTES {
-            return Err(SignalMarkerError::Failed("too_large"));
+        let size_error = |len: u64| {
+            if len > SIGNAL_MAX_ATTACHMENT_BYTES {
+                SignalMarkerError::Failed("too_large")
+            } else {
+                SignalMarkerError::Failed("over_budget")
+            }
+        };
+        let limit = budget.min(SIGNAL_MAX_ATTACHMENT_BYTES);
+        if metadata.len() > limit {
+            return Err(size_error(metadata.len()));
         }
-        let data = tokio::fs::read(&path)
+        // Capped read: a file that grows after the size check still cannot
+        // push past the limit.
+        let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
+        tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| SignalMarkerError::Failed("read_error"))?
+            .take(limit + 1)
+            .read_to_end(&mut data)
             .await
             .map_err(|_| SignalMarkerError::Failed("read_error"))?;
+        let file_len = data.len() as u64;
+        if file_len > limit {
+            return Err(size_error(file_len));
+        }
 
         let mime = mime_guess::from_path(&path)
             .first_raw()
@@ -836,7 +923,7 @@ impl SignalChannel {
             .unwrap_or("application/octet-stream");
         let mut uri = format!("data:{mime};filename={};base64,", data_uri_file_name(&path));
         base64::engine::general_purpose::STANDARD.encode_string(&data, &mut uri);
-        Ok(uri)
+        Ok((uri, file_len))
     }
 
     /// Send a multiple-choice poll to `recipient` (E.164 number, UUID,
@@ -945,6 +1032,52 @@ async fn save_inbound_attachment(
     file.write_all(data).await?;
     file.flush().await?;
     Ok(path)
+}
+
+/// Padded base64 length of `n` bytes.
+fn base64_len(n: u64) -> u64 {
+    n.div_ceil(3) * 4
+}
+
+/// Read a response body, failing as soon as it passes `limit` bytes rather
+/// than after buffering all of it.
+async fn read_body_limited(mut resp: reqwest::Response, limit: u64) -> anyhow::Result<Vec<u8>> {
+    let too_large = || {
+        anyhow::Error::msg(format!(
+            "signal-cli response exceeds the {limit}-byte limit"
+        ))
+    };
+    if resp.content_length().is_some_and(|len| len > limit) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if (body.len() + chunk.len()) as u64 > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Saved-file form of a sender-supplied file name. The shared marker parser
+/// ends a marker at the first `]` and trims its target, so brackets, control
+/// characters, and edge whitespace would leave the saved path unreachable
+/// through its own marker.
+fn marker_safe_file_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "attachment".to_string();
+    }
+    name.chars()
+        .map(|c| {
+            if matches!(c, '[' | ']') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// File name for a signal-cli data URI, limited to characters that cannot be
@@ -3041,7 +3174,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let ch = media_channel("http://127.0.0.1:1", false);
         assert_eq!(
-            ch.resolve_outbound_marker("photo.png").await,
+            ch.resolve_outbound_marker("photo.png", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                .await,
             Err(SignalMarkerError::Refused("no_workspace"))
         );
 
@@ -3053,7 +3187,8 @@ mod tests {
             "file:///etc/hostname",
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(target).await,
+                ch.resolve_outbound_marker(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                    .await,
                 Err(SignalMarkerError::Refused("scheme")),
                 "{target}"
             );
@@ -3076,7 +3211,8 @@ mod tests {
             format!("sub/../../{outside_name}"),
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(&target).await,
+                ch.resolve_outbound_marker(&target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                    .await,
                 Err(SignalMarkerError::Refused("outside_workspace")),
                 "{target}"
             );
@@ -3093,7 +3229,8 @@ mod tests {
             media_channel("http://127.0.0.1:1", false).with_workspace_dir(workspace.path().into());
 
         assert_eq!(
-            ch.resolve_outbound_marker("link.txt").await,
+            ch.resolve_outbound_marker("link.txt", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                .await,
             Err(SignalMarkerError::Refused("outside_workspace"))
         );
     }
@@ -3113,7 +3250,8 @@ mod tests {
             ("big.bin", "too_large"),
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(target).await,
+                ch.resolve_outbound_marker(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                    .await,
                 Err(SignalMarkerError::Failed(reason)),
                 "{target}"
             );
@@ -3361,5 +3499,189 @@ mod tests {
             b64(b"%PDF-1.4")
         );
         assert_eq!(params["attachments"], serde_json::json!([expected]));
+    }
+
+    #[tokio::test]
+    async fn inbound_attachments_past_the_message_budget_are_not_downloaded() {
+        let payload = vec![7u8; 600];
+        let server = attachment_server(attachment_data(&payload), 1).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false)
+            .with_workspace_dir(workspace.path().into())
+            .with_attachment_budget(600);
+        let env = attachment_envelope(
+            Some("three files"),
+            None,
+            vec![
+                serde_json::json!({ "id": "att1", "contentType": "application/pdf", "size": 600 }),
+                // No declared size: only the exhausted budget can stop it.
+                serde_json::json!({ "id": "att2", "contentType": "application/pdf" }),
+                serde_json::json!({ "id": "att3", "contentType": "application/pdf", "size": 10 }),
+            ],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].data, payload);
+        let marker = msg.attachments[0].marker.as_ref().expect("rendered marker");
+        assert_eq!(
+            msg.content,
+            format!("three files\n[DOCUMENT:{}]", marker.target)
+        );
+        let downloads = rpc_params(&server, "getAttachment").await;
+        assert_eq!(downloads.len(), 1, "budget spent: no further downloads");
+        assert_eq!(downloads[0]["id"], "att1");
+    }
+
+    #[tokio::test]
+    async fn inbound_declared_size_past_the_remaining_budget_skips_the_download() {
+        let server = attachment_server(attachment_data(&[1u8; 600]), 1).await;
+        let ch = media_channel(&server.uri(), false).with_attachment_budget(1000);
+        let env = attachment_envelope(
+            Some("two files"),
+            None,
+            vec![
+                serde_json::json!({ "id": "att1", "contentType": "image/png", "size": 600 }),
+                serde_json::json!({ "id": "att2", "contentType": "image/png", "size": 600 }),
+            ],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.content, "two files");
+        assert_eq!(msg.attachments.len(), 1);
+        let downloads = rpc_params(&server, "getAttachment").await;
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0]["id"], "att1");
+    }
+
+    #[tokio::test]
+    async fn inbound_response_past_the_cap_is_refused_without_a_declared_size() {
+        // The payload itself fits the budget; only the response is oversized
+        // (well past base64(budget) plus the envelope allowance), so the
+        // download can only be refused by the response cap.
+        let oversized = rpc_result(serde_json::json!({
+            "data": b64(b"%PDF-1.4"),
+            "padding": "x".repeat(2 * SIGNAL_RPC_ENVELOPE_BYTES as usize),
+        }));
+        let server = attachment_server(oversized, 2).await;
+        let ch = media_channel(&server.uri(), false).with_attachment_budget(1024);
+
+        let err = ch
+            .rpc_request_limited(
+                "getAttachment",
+                serde_json::json!({ "id": "att1" }),
+                Some(base64_len(1024) + SIGNAL_RPC_ENVELOPE_BYTES),
+            )
+            .await
+            .expect_err("response is over the cap");
+        assert!(format!("{err:#}").contains("byte limit"), "{err:#}");
+
+        let env = attachment_envelope(
+            Some("caption"),
+            None,
+            vec![serde_json::json!({ "id": "att1", "contentType": "video/mp4" })],
+        );
+        let msg = receive(&ch, &env).await.expect("text survives");
+        assert_eq!(msg.content, "caption");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_stops_attaching_files_past_the_message_budget() {
+        let server = send_server().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.bin"), [1u8; 600]).unwrap();
+        std::fs::write(workspace.path().join("b.bin"), [2u8; 600]).unwrap();
+        std::fs::write(workspace.path().join("c.bin"), [3u8; 300]).unwrap();
+        let ch = media_channel(&server.uri(), false)
+            .with_workspace_dir(workspace.path().into())
+            .with_attachment_budget(1000);
+
+        let msg = SendMessage::new(
+            "Files [DOCUMENT:a.bin] [DOCUMENT:b.bin] [DOCUMENT:c.bin]",
+            "+1111111111",
+        );
+        let params = send_and_capture(&ch, &server, msg).await;
+
+        let attachments = params["attachments"].as_array().expect("attachments");
+        assert_eq!(attachments.len(), 2, "a.bin and c.bin fit; b.bin does not");
+        assert!(
+            attachments[0]
+                .as_str()
+                .unwrap()
+                .ends_with(&b64(&[1u8; 600]))
+        );
+        assert!(
+            attachments[1]
+                .as_str()
+                .unwrap()
+                .ends_with(&b64(&[3u8; 300]))
+        );
+        let message = params["message"].as_str().expect("message text");
+        assert!(message.starts_with("Files"), "{message}");
+        assert!(
+            message.contains('1'),
+            "note counts the dropped file: {message}"
+        );
+
+        assert_eq!(
+            ch.resolve_outbound_marker("b.bin", 400).await,
+            Err(SignalMarkerError::Failed("over_budget"))
+        );
+    }
+
+    #[test]
+    fn marker_safe_file_name_keeps_saved_paths_parseable() {
+        for (name, expected) in [
+            ("report]v2.pdf", "report_v2.pdf"),
+            ("[draft] notes.txt", "_draft_ notes.txt"),
+            ("line\nbreak.txt", "line_break.txt"),
+            ("trailing.pdf  ", "trailing.pdf"),
+            ("写真.jpg", "写真.jpg"),
+            (" \t ", "attachment"),
+        ] {
+            assert_eq!(marker_safe_file_name(name), expected, "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_bracketed_file_name_round_trips_through_its_marker() {
+        let server = attachment_server(attachment_data(b"%PDF-1.4"), 1).await;
+        rpc_method("send")
+            .respond_with(rpc_result(serde_json::json!({ "timestamp": 1 })))
+            .mount(&server)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            None,
+            None,
+            vec![serde_json::json!({
+                "id": "att4",
+                "contentType": "application/pdf",
+                "filename": "report]v2.pdf",
+            })],
+        );
+
+        let inbound = receive(&ch, &env).await.expect("delivered");
+        assert_eq!(inbound.attachments[0].file_name, "report]v2.pdf");
+        let marker = inbound.attachments[0]
+            .marker
+            .as_ref()
+            .expect("rendered marker");
+        assert!(
+            marker.target.ends_with("_report_v2.pdf"),
+            "{}",
+            marker.target
+        );
+
+        let reply = format!("Again {}", inbound.content);
+        let params = send_and_capture(&ch, &server, SendMessage::new(reply, "+1111111111")).await;
+
+        assert_eq!(params["message"], "Again");
+        let attachment = params["attachments"][0].as_str().expect("one attachment");
+        assert!(attachment.ends_with(&b64(b"%PDF-1.4")), "{attachment}");
     }
 }
