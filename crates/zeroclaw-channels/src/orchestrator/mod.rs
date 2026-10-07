@@ -21148,12 +21148,18 @@ temperature = 0.3
         let _restore = CronChannelRegistryRestore(previous);
 
         let running = mock_channel("whatsapp");
+        let sibling = mock_channel("whatsapp");
         let other = mock_channel("telegram");
         let (_published, _lease) = publish_cron_channel_registry(&[
             ConfiguredChannel {
                 display_name: "WhatsApp",
                 alias: Some("ventas".to_string()),
                 channel: Arc::clone(&running),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("soporte".to_string()),
+                channel: Arc::clone(&sibling),
             },
             ConfiguredChannel {
                 display_name: "Telegram",
@@ -21169,6 +21175,12 @@ temperature = 0.3
             Arc::ptr_eq(map.get("whatsapp.ventas").unwrap(), &running),
             "a daemon turn must get the instance the channel task is running"
         );
+        assert!(
+            !map.contains_key("whatsapp.soporte"),
+            "an exact binding must not admit another alias of the same type"
+        );
+        // The bare key follows the agent's own bindings, so it stays
+        // unambiguous even though two WhatsApp aliases are running.
         assert!(Arc::ptr_eq(map.get("whatsapp").unwrap(), &running));
         assert!(
             !map.contains_key("telegram.ops") && !map.contains_key("telegram"),
