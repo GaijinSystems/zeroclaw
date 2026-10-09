@@ -3522,16 +3522,17 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             // back to a deliberately expensive estimate when a malformed
             // header cannot be projected. The latter is only reached for
             // input that will fail full decode anyway, and ensures it cannot
-            // sneak past the pre-decode per-image cap. On every path `image`'s
-            // JPEG adapter also reads the whole encoded input into its own
-            // `Vec` and keeps it for the decode, so that copy is charged too.
+            // sneak past the pre-decode per-image cap. On every path two copies
+            // of the encoded input are live for the decode: the owned buffer
+            // `validate_image_content_with_projection` moves into the blocking
+            // task, and the `Vec` `image`'s JPEG adapter reads that buffer into.
             jpeg_auxiliary_allocation(bytes, width, height)
                 .unwrap_or_else(|| {
                     pixels
                         .saturating_mul(8)
                         .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
                 })
-                .saturating_add(bytes.len() as u64)
+                .saturating_add((bytes.len() as u64).saturating_mul(2))
         }
         _ => 0,
     };
@@ -6007,15 +6008,48 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_projection_charges_the_adapters_input_copy() {
-        // `image`'s JPEG adapter holds its own copy of the encoded input for
-        // the whole decode.
+    fn jpeg_projection_charges_both_input_copies() {
+        // The validator's owned buffer and `image`'s adapter copy of it are
+        // both live for the whole decode.
         let bytes = valid_jpeg();
         let auxiliary = jpeg_auxiliary_allocation(&bytes, 1, 1).unwrap();
         assert_eq!(
             projected_allocation("pixel.jpg", "image/jpeg", &bytes).unwrap(),
-            3 + auxiliary + bytes.len() as u64
+            3 + auxiliary + 2 * bytes.len() as u64
         );
+    }
+
+    #[tokio::test]
+    async fn near_limit_baseline_jpeg_is_refused_once_both_input_copies_count() {
+        // A 4000x4000 single-scan baseline frame with 10 MiB of encoded input:
+        // output, row scratch, and one input copy fit under the cap, but the
+        // second live copy does not.
+        let mut bytes = jpeg_with_declared_dimensions(4000, 4000);
+        bytes.resize(10 * 1024 * 1024, 0);
+        let header = jpeg_frame_header(&bytes).expect("encoded JPEG has a frame header");
+        assert!(header.first_scan_decodes_rows);
+
+        let row_scratch = jpeg_auxiliary_allocation(&bytes, 4000, 4000).unwrap();
+        let input = bytes.len() as u64;
+        let with_one_copy = 4000u64 * 4000 * 3 + row_scratch + input;
+        assert!(with_one_copy <= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert_eq!(
+            projected_allocation("near-limit.jpg", "image/jpeg", &bytes).unwrap(),
+            with_one_copy + input
+        );
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("near-limit.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("both input copies push the frame over the per-image cap")
+        })
+        .await;
+        assert!(matches!(
+            multimodal_error_kind(&error),
+            "image_too_large" | "corrupt_image"
+        ));
+        assert_eq!(decodes, 0);
     }
 
     #[test]
