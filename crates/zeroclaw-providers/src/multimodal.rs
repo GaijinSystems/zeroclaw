@@ -3100,11 +3100,13 @@ const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 const APNG_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
 
 /// JPEG coefficient samples are signed 16-bit values. `zune-jpeg` keeps a
-/// full padded coefficient plane for progressive images (and for baseline
-/// images whose scans do not contain every component), so the projection must
-/// account for those planes before admitting a decode. The row-sized buffers
-/// used by baseline upsampling are covered by the additional scratch factor in
-/// [`jpeg_auxiliary_allocation`].
+/// full padded coefficient plane for progressive images and for baseline
+/// images whose first scan does not contain every component, so the projection
+/// must account for those planes before admitting a decode. A baseline image
+/// whose first scan contains every component is decoded one MCU row at a time
+/// and never allocates them (`all_components_in_first_scan` in zune-jpeg
+/// 0.5.15 `src/mcu.rs`). The row-sized buffers both paths use are covered by
+/// the additional scratch factor in [`jpeg_auxiliary_allocation`].
 const JPEG_COEFFICIENT_BYTES_PER_SAMPLE: u64 = 2;
 // The largest upsampling ratio accepted by zune-jpeg is 4x4. Charging 32
 // copies of one padded coefficient row covers the row/row_up, upsample
@@ -3113,18 +3115,37 @@ const JPEG_SCRATCH_ROWS_MULTIPLIER: u64 = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct JpegComponentSampling {
+    id: u8,
     horizontal: u8,
     vertical: u8,
 }
 
 /// Header information needed to conservatively project zune-jpeg's
-/// coefficient allocation. This parser only walks marker lengths and SOF;
-/// entropy-coded data is never touched.
+/// coefficient allocation. This parser only walks marker lengths, SOF, and the
+/// first SOS header; entropy-coded data is never touched.
 #[derive(Debug)]
 struct JpegFrameHeader {
     width: u32,
     height: u32,
     components: Vec<JpegComponentSampling>,
+    /// The frame is sequential (SOF0/SOF1) and its first scan names every
+    /// frame component, so zune-jpeg decodes MCU rows straight to pixels
+    /// without full-image coefficient planes. `false` whenever that cannot be
+    /// established, which keeps the coefficient charge.
+    first_scan_decodes_rows: bool,
+}
+
+/// What the projection finds between a frame header and the first scan.
+enum JpegFirstScan {
+    /// A well-formed first SOS that names every frame component.
+    CoversFrame,
+    /// A first SOS that omits a component, or anything the walk cannot
+    /// classify; the coefficient charge stays.
+    Unclassified,
+    /// Another frame header before the first scan. zune-jpeg parses every frame
+    /// header it reaches, so a later one could change the frame shape or switch
+    /// to progressive decoding.
+    AnotherFrame,
 }
 
 fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
@@ -3187,15 +3208,23 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
                     return None;
                 }
                 components.push(JpegComponentSampling {
+                    id: component[0],
                     horizontal,
                     vertical,
                 });
             }
 
+            let first_scan_decodes_rows = match jpeg_first_scan(bytes, payload_end, &components) {
+                Some(JpegFirstScan::AnotherFrame) => return None,
+                Some(JpegFirstScan::CoversFrame) => marker != 0xc2,
+                Some(JpegFirstScan::Unclassified) | None => false,
+            };
+
             return Some(JpegFrameHeader {
                 width: u32::from_be_bytes([0, 0, payload[3], payload[4]]),
                 height: u32::from_be_bytes([0, 0, payload[1], payload[2]]),
                 components,
+                first_scan_decodes_rows,
             });
         }
 
@@ -3205,8 +3234,78 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
     None
 }
 
+/// Walk from the end of the frame header to the first SOS with the same
+/// marker rules as [`jpeg_frame_header`]. `None` means the stream ended or a
+/// segment was truncated before a first scan was found.
+fn jpeg_first_scan(
+    bytes: &[u8],
+    mut offset: usize,
+    components: &[JpegComponentSampling],
+) -> Option<JpegFirstScan> {
+    loop {
+        if bytes.get(offset) != Some(&0xff) {
+            return Some(JpegFirstScan::Unclassified);
+        }
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+
+        if marker == 0 {
+            continue;
+        }
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
+            return Some(JpegFirstScan::Unclassified);
+        }
+        if matches!(marker, 0xc0..=0xc2) {
+            return Some(JpegFirstScan::AnotherFrame);
+        }
+
+        let length_bytes = bytes.get(offset..offset + 2)?;
+        let segment_len = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if segment_len < 2 {
+            return Some(JpegFirstScan::Unclassified);
+        }
+        let payload_start = offset + 2;
+        let payload_end = payload_start.checked_add(segment_len - 2)?;
+        let payload = bytes.get(payload_start..payload_end)?;
+
+        if marker == 0xda {
+            // zune-jpeg's `parse_sos` accepts 1..=4 selectors, an SOS length
+            // of exactly 6 + 2 * Ns, and only distinct IDs present in the
+            // frame. It then decodes rows directly when Ns equals the frame's
+            // component count.
+            let Some((&count, selectors)) = payload.split_first() else {
+                return Some(JpegFirstScan::Unclassified);
+            };
+            let count = usize::from(count);
+            if !(1..=4).contains(&count) || payload.len() != 4 + 2 * count {
+                return Some(JpegFirstScan::Unclassified);
+            }
+            let mut seen = Vec::with_capacity(count);
+            for selector in selectors[..2 * count].as_chunks::<2>().0 {
+                let id = selector[0];
+                if seen.contains(&id) || !components.iter().any(|c| c.id == id) {
+                    return Some(JpegFirstScan::Unclassified);
+                }
+                seen.push(id);
+            }
+            return Some(if count == components.len() {
+                JpegFirstScan::CoversFrame
+            } else {
+                JpegFirstScan::Unclassified
+            });
+        }
+
+        offset = payload_end;
+    }
+}
+
 /// Conservative JPEG auxiliary allocation (coefficients plus row scratch),
-/// derived from the SOF dimensions and sampling factors. Returns `None` for a
+/// derived from the SOF dimensions and sampling factors. The coefficient planes
+/// are left out only when [`JpegFrameHeader::first_scan_decodes_rows`] shows
+/// zune-jpeg will not allocate them. Returns `None` for a
 /// malformed/unprojectable header; callers then use a worst-case fallback so
 /// malformed input is refused rather than admitted cheaply.
 fn jpeg_auxiliary_allocation(bytes: &[u8], width: u32, height: u32) -> Option<u64> {
@@ -3248,7 +3347,11 @@ fn jpeg_auxiliary_allocation(bytes: &[u8], width: u32, height: u32) -> Option<u6
         row_bytes = row_bytes.checked_add(row)?;
     }
 
-    coefficient_bytes.checked_add(row_bytes.checked_mul(JPEG_SCRATCH_ROWS_MULTIPLIER)?)
+    let row_scratch = row_bytes.checked_mul(JPEG_SCRATCH_ROWS_MULTIPLIER)?;
+    if header.first_scan_decodes_rows {
+        return Some(row_scratch);
+    }
+    coefficient_bytes.checked_add(row_scratch)
 }
 
 /// How each format's animation scratch splits between state the decoder keeps
@@ -3419,12 +3522,16 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             // back to a deliberately expensive estimate when a malformed
             // header cannot be projected. The latter is only reached for
             // input that will fail full decode anyway, and ensures it cannot
-            // sneak past the pre-decode per-image cap.
-            jpeg_auxiliary_allocation(bytes, width, height).unwrap_or_else(|| {
-                pixels
-                    .saturating_mul(8)
-                    .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
-            })
+            // sneak past the pre-decode per-image cap. On every path `image`'s
+            // JPEG adapter also reads the whole encoded input into its own
+            // `Vec` and keeps it for the decode, so that copy is charged too.
+            jpeg_auxiliary_allocation(bytes, width, height)
+                .unwrap_or_else(|| {
+                    pixels
+                        .saturating_mul(8)
+                        .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
+                })
+                .saturating_add(bytes.len() as u64)
         }
         _ => 0,
     };
@@ -4274,6 +4381,52 @@ mod tests {
         for (index, &(horizontal, vertical)) in sampling.iter().enumerate() {
             bytes.extend_from_slice(&[(index + 1) as u8, (horizontal << 4) | vertical, 0]);
         }
+        bytes
+    }
+
+    /// A 17x9 frame header of type `sof_marker` followed by a first SOS that
+    /// selects `scan_ids`. Component IDs are 1-based, as in [`jpeg_sof_header`].
+    fn jpeg_frame_and_first_scan(
+        sof_marker: u8,
+        sampling: &[(u8, u8)],
+        scan_ids: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = jpeg_sof_header(17, 9, sampling);
+        bytes[3] = sof_marker;
+        bytes.extend_from_slice(&[
+            0xff,
+            0xda,
+            0x00,
+            (6 + 2 * scan_ids.len()) as u8,
+            scan_ids.len() as u8,
+        ]);
+        for &id in scan_ids {
+            bytes.extend_from_slice(&[id, 0x00]);
+        }
+        bytes.extend_from_slice(&[0x00, 0x3f, 0x00]);
+        bytes
+    }
+
+    /// An ordinary encoded photo: `image`'s encoder writes a sequential
+    /// single-scan JPEG.
+    fn encoded_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let photo = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(photo)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("test JPEG encodes");
+        buf.into_inner()
+    }
+
+    /// `bytes` with its sequential frame header relabelled as progressive.
+    fn relabelled_progressive(mut bytes: Vec<u8>) -> Vec<u8> {
+        let sof = bytes
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("encoded test JPEG has a baseline frame header");
+        bytes[sof + 1] = 0xc2;
         bytes
     }
 
@@ -5766,6 +5919,156 @@ mod tests {
         assert!(per_image_cap_refusal("large.jpg", "image/jpeg", projected).is_some());
     }
 
+    // Same 17x9 4:2:0 shape as the padded-sampling test above.
+    const SMALL_420_COEFFICIENTS: u64 = (8 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE;
+    const SMALL_420_ROW_SCRATCH: u64 =
+        (4 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE * JPEG_SCRATCH_ROWS_MULTIPLIER;
+    const SAMPLING_420: [(u8, u8); 3] = [(2, 2), (1, 1), (1, 1)];
+
+    #[test]
+    fn sequential_first_scan_with_every_component_charges_row_scratch_only() {
+        for sof in [0xc0, 0xc1] {
+            let bytes = jpeg_frame_and_first_scan(sof, &SAMPLING_420, &[1, 2, 3]);
+            assert_eq!(
+                jpeg_auxiliary_allocation(&bytes, 17, 9),
+                Some(SMALL_420_ROW_SCRATCH),
+                "SOF{:x} decodes rows directly, without coefficient planes",
+                sof - 0xc0
+            );
+        }
+        // Scan order does not matter, only coverage.
+        let bytes = jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[3, 1, 2]);
+        assert_eq!(
+            jpeg_auxiliary_allocation(&bytes, 17, 9),
+            Some(SMALL_420_ROW_SCRATCH)
+        );
+    }
+
+    #[test]
+    fn progressive_or_split_first_scan_keeps_coefficient_planes() {
+        let full = Some(SMALL_420_COEFFICIENTS + SMALL_420_ROW_SCRATCH);
+        for (sof, scan) in [
+            (0xc2, &[1, 2, 3][..]),
+            (0xc2, &[1][..]),
+            (0xc0, &[1][..]),
+            (0xc0, &[1, 2][..]),
+            (0xc1, &[2, 3][..]),
+        ] {
+            let bytes = jpeg_frame_and_first_scan(sof, &SAMPLING_420, scan);
+            assert_eq!(
+                jpeg_auxiliary_allocation(&bytes, 17, 9),
+                full,
+                "SOF{:x} with first scan {scan:?} must keep the coefficient charge",
+                sof - 0xc0
+            );
+        }
+    }
+
+    #[test]
+    fn unclassifiable_first_scan_keeps_coefficient_planes() {
+        let full = Some(SMALL_420_COEFFICIENTS + SMALL_420_ROW_SCRATCH);
+        let cases: [(&str, Vec<u8>); 6] = [
+            ("no scan header", jpeg_sof_header(17, 9, &SAMPLING_420)),
+            (
+                "unknown component ID",
+                jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[1, 2, 9]),
+            ),
+            (
+                "duplicate component ID",
+                jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[1, 1, 2]),
+            ),
+            ("wrong SOS length", {
+                let mut bytes = jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[1, 2, 3]);
+                // Low byte of the SOS length, right after the 21-byte SOI + SOF.
+                bytes[24] -= 2;
+                bytes
+            }),
+            ("truncated SOS", {
+                let mut bytes = jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[1, 2, 3]);
+                bytes.truncate(bytes.len() - 4);
+                bytes
+            }),
+            ("standalone marker before the scan", {
+                let mut bytes = jpeg_sof_header(17, 9, &SAMPLING_420);
+                bytes.extend_from_slice(&[0xff, 0x01]);
+                bytes.extend_from_slice(
+                    &jpeg_frame_and_first_scan(0xc0, &SAMPLING_420, &[1, 2, 3])[21..],
+                );
+                bytes
+            }),
+        ];
+        for (case, bytes) in cases {
+            assert_eq!(
+                jpeg_auxiliary_allocation(&bytes, 17, 9),
+                full,
+                "{case} must keep the coefficient charge"
+            );
+        }
+    }
+
+    #[test]
+    fn jpeg_projection_charges_the_adapters_input_copy() {
+        // `image`'s JPEG adapter holds its own copy of the encoded input for
+        // the whole decode.
+        let bytes = valid_jpeg();
+        let auxiliary = jpeg_auxiliary_allocation(&bytes, 1, 1).unwrap();
+        assert_eq!(
+            projected_allocation("pixel.jpg", "image/jpeg", &bytes).unwrap(),
+            3 + auxiliary + bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn second_frame_header_before_first_scan_uses_the_malformed_fallback() {
+        // zune-jpeg parses every frame header it reaches, so a progressive SOF
+        // after a baseline one would switch the decode to progressive.
+        let mut bytes = jpeg_sof_header(17, 9, &SAMPLING_420);
+        bytes.extend_from_slice(&jpeg_frame_and_first_scan(0xc2, &SAMPLING_420, &[1, 2, 3])[2..]);
+        assert!(jpeg_frame_header(&bytes).is_none());
+        assert!(jpeg_auxiliary_allocation(&bytes, 17, 9).is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_baseline_photo_passes_the_production_validator() {
+        // A 3840x2160 4:4:4 photo projects to ~74 MiB when its coefficient
+        // planes are charged, which used to refuse it, but a single-scan
+        // baseline decode peaks at ~25 MiB.
+        let bytes = encoded_jpeg(3840, 2160);
+        let header = jpeg_frame_header(&bytes).expect("encoded JPEG has a frame header");
+        assert!(header.first_scan_decodes_rows);
+
+        let projected = projected_allocation("photo.jpg", "image/jpeg", &bytes).unwrap();
+        assert!(projected <= MAX_DECODED_IMAGE_ALLOC_BYTES, "{projected}");
+        let output = 3840u64 * 2160 * 3;
+        let progressive = relabelled_progressive(bytes.clone());
+        let with_coefficients =
+            output + jpeg_auxiliary_allocation(&progressive, 3840, 2160).unwrap();
+        assert!(with_coefficients > MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let (result, decodes) = counting_decodes(async {
+            validate_within_budget("photo.jpg", "image/jpeg", &bytes, &mut budget).await
+        })
+        .await;
+        result.expect("an ordinary baseline photo must be admitted");
+        assert_eq!(decodes, 1);
+
+        // The same frame relabelled progressive keeps the coefficient charge
+        // and is refused before any pixel decoding.
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("photo.jpg", "image/jpeg", &progressive, &mut budget)
+                .await
+                .expect_err("a progressive frame must keep its coefficient charge")
+        })
+        .await;
+        assert!(matches!(
+            multimodal_error_kind(&error),
+            "image_too_large" | "corrupt_image"
+        ));
+        assert_eq!(decodes, 0);
+    }
+
     #[tokio::test]
     async fn unprefixed_jpeg_frame_header_cannot_undercharge_admission() {
         let ordinary = valid_jpeg();
@@ -5850,7 +6153,10 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_jpeg_sof_marker_cannot_undercharge_admission() {
-        let mut bytes = jpeg_with_declared_dimensions(3000, 3000);
+        // Large enough that the real frame's output alone exceeds the cap: the
+        // encoded first scan covers every component, so no coefficient planes
+        // are charged.
+        let mut bytes = jpeg_with_declared_dimensions(5000, 5000);
         // zune-jpeg 0.5.15 treats C3 as an unknown length-bearing marker and
         // continues to the real three-component frame header. The projection
         // must do the same instead of trusting this smaller fake header.
@@ -5863,8 +6169,8 @@ mod tests {
 
         let header = jpeg_frame_header(&bytes).expect("the real frame header must be found");
         assert_eq!(header.components.len(), 3);
-        let projected = 3000u64 * 3000 * 3
-            + jpeg_auxiliary_allocation(&bytes, 3000, 3000)
+        let projected = 5000u64 * 5000 * 3
+            + jpeg_auxiliary_allocation(&bytes, 5000, 5000)
                 .expect("the real frame must have a conservative projection");
         assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
 
