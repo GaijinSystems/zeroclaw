@@ -3142,10 +3142,19 @@ enum JpegFirstScan {
     /// A first SOS that omits a component, or anything the walk cannot
     /// classify; the coefficient charge stays.
     Unclassified,
-    /// Another frame header before the first scan. zune-jpeg parses every frame
-    /// header it reaches, so a later one could change the frame shape or switch
-    /// to progressive decoding.
+    /// Another frame header before the first scan. zune-jpeg rejects a second
+    /// frame header, and the projection does not classify a frame whose header
+    /// is ambiguous.
     AnotherFrame,
+}
+
+/// Bytes zune-jpeg 0.5.15 reads past a segment's declared end. Its APP0 parser
+/// reads a 5-byte probe whenever the length exceeds 5 and then skips the
+/// saturating remainder, so a declared length of exactly 6 consumes one byte
+/// more than declared. Every other segment it accepts consumes exactly the
+/// declared length.
+fn zune_jpeg_segment_overread(marker: u8, declared: usize) -> usize {
+    usize::from(marker == 0xe0 && declared == 6)
 }
 
 fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
@@ -3228,7 +3237,7 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
             });
         }
 
-        offset = payload_end;
+        offset = payload_end + zune_jpeg_segment_overread(marker, segment_len);
     }
 
     None
@@ -3298,8 +3307,108 @@ fn jpeg_first_scan(
             });
         }
 
-        offset = payload_end;
+        offset = payload_end + zune_jpeg_segment_overread(marker, segment_len);
     }
+}
+
+/// Allowance per metadata segment for the record zune-jpeg keeps for it, such
+/// as an `ExtendedXmpSegment` (56 bytes plus a 32-byte GUID allocation) or an
+/// `ICCChunk` (32 bytes), in a `Vec` whose capacity may have doubled.
+const JPEG_METADATA_SEGMENT_OVERHEAD_BYTES: u64 = 192;
+
+/// The marker context [`jpeg_retained_metadata_allocation`] is in, following
+/// zune-jpeg 0.5.15. Which markers carry a length differs between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JpegWalkContext {
+    /// Before the first SOS (`decode_headers_internal`): every marker other
+    /// than SOS and EOI is read with its length, including RST, SOI, and TEM,
+    /// which reach the length-skipping default arm of `parse_marker_inner`.
+    Headers,
+    /// Entropy-coded data after an SOS, where restart markers carry no length.
+    Scan,
+    /// Markers after a scan. Baseline frames read every marker other than SOS
+    /// and EOI with its length (`advance_to_next_sos`); progressive frames
+    /// handle RST without one and the rest through `parse_marker_inner`.
+    BetweenScans,
+}
+
+/// Upper bound on the metadata zune-jpeg 0.5.15 copies out of the stream and
+/// keeps for the whole decode: EXIF, XMP, extended XMP, IPTC, ICC, MPF, and
+/// gain-map payloads, all carried in APPn segments, wherever they appear
+/// (zune-jpeg also parses markers between and after scans). Twice each payload
+/// covers the retained copy and the buffer extended XMP is reassembled into
+/// while its chunks are still held.
+///
+/// The walk follows zune-jpeg's marker handling in each [`JpegWalkContext`],
+/// skipping each segment by the length zune-jpeg consumes: the declared length,
+/// plus [`zune_jpeg_segment_overread`]. Stuffed zeros and fill bytes are never markers, and
+/// nothing after EOI is parsed. Where zune-jpeg stops early, on an error or a
+/// marker that ends a baseline decode, the walk carries on, which can only
+/// over-count.
+fn jpeg_retained_metadata_allocation(bytes: &[u8]) -> u64 {
+    let mut total = 0u64;
+    let mut offset = 2usize;
+    let mut context = JpegWalkContext::Headers;
+    let mut progressive = false;
+    while let Some(found) = bytes
+        .get(offset..)
+        .and_then(|rest| rest.iter().position(|&byte| byte == 0xff))
+    {
+        let at = offset + found;
+        let Some(&marker) = bytes.get(at + 1) else {
+            break;
+        };
+        match marker {
+            // A fill byte: any marker follows the last 0xFF.
+            0xff => {
+                offset = at + 1;
+                continue;
+            }
+            // A stuffed zero is data in every context.
+            0x00 => {
+                offset = at + 2;
+                continue;
+            }
+            // zune-jpeg stops at EOI after a scan and rejects one before it.
+            0xd9 => break,
+            _ => {}
+        }
+        let restart = (0xd0..=0xd7).contains(&marker);
+        let lengthless = restart
+            && match context {
+                JpegWalkContext::Headers => false,
+                JpegWalkContext::Scan => true,
+                JpegWalkContext::BetweenScans => progressive,
+            };
+        if lengthless {
+            offset = at + 2;
+            continue;
+        }
+        let Some(length) = bytes.get(at + 2..at + 4) else {
+            break;
+        };
+        let declared = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        if matches!(marker, 0xe0..=0xef | 0xfe) {
+            let available = bytes.len().saturating_sub(at + 4);
+            let payload = declared.saturating_sub(2).min(available) as u64;
+            total = total
+                .saturating_add(payload.saturating_mul(2))
+                .saturating_add(JPEG_METADATA_SEGMENT_OVERHEAD_BYTES);
+        }
+        if context == JpegWalkContext::Headers && marker == 0xc2 {
+            progressive = true;
+        }
+        // zune-jpeg skips `declared - 2` bytes after the length field, plus
+        // its APP0 over-read. A length below 2 is rejected in headers and read
+        // without a skip between baseline scans.
+        offset = at + 4 + declared.saturating_sub(2) + zune_jpeg_segment_overread(marker, declared);
+        context = match (marker, context) {
+            (0xda, _) => JpegWalkContext::Scan,
+            (_, JpegWalkContext::Headers) => JpegWalkContext::Headers,
+            _ => JpegWalkContext::BetweenScans,
+        };
+    }
+    total
 }
 
 /// Conservative JPEG auxiliary allocation (coefficients plus row scratch),
@@ -3526,6 +3635,7 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             // of the encoded input are live for the decode: the owned buffer
             // `validate_image_content_with_projection` moves into the blocking
             // task, and the `Vec` `image`'s JPEG adapter reads that buffer into.
+            // The decoder's retained metadata is live alongside them.
             jpeg_auxiliary_allocation(bytes, width, height)
                 .unwrap_or_else(|| {
                     pixels
@@ -3533,6 +3643,7 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
                         .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
                 })
                 .saturating_add((bytes.len() as u64).saturating_mul(2))
+                .saturating_add(jpeg_retained_metadata_allocation(bytes))
         }
         _ => 0,
     };
@@ -6015,7 +6126,7 @@ mod tests {
         let auxiliary = jpeg_auxiliary_allocation(&bytes, 1, 1).unwrap();
         assert_eq!(
             projected_allocation("pixel.jpg", "image/jpeg", &bytes).unwrap(),
-            3 + auxiliary + 2 * bytes.len() as u64
+            3 + auxiliary + 2 * bytes.len() as u64 + jpeg_retained_metadata_allocation(&bytes)
         );
     }
 
@@ -6031,7 +6142,8 @@ mod tests {
 
         let row_scratch = jpeg_auxiliary_allocation(&bytes, 4000, 4000).unwrap();
         let input = bytes.len() as u64;
-        let with_one_copy = 4000u64 * 4000 * 3 + row_scratch + input;
+        let with_one_copy =
+            4000u64 * 4000 * 3 + row_scratch + input + jpeg_retained_metadata_allocation(&bytes);
         assert!(with_one_copy <= MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert_eq!(
             projected_allocation("near-limit.jpg", "image/jpeg", &bytes).unwrap(),
@@ -6052,10 +6164,235 @@ mod tests {
         assert_eq!(decodes, 0);
     }
 
+    /// Largest ICC payload one APP2 chunk carries.
+    const ICC_CHUNK_BYTES: usize = 65_535 - 2 - 14;
+
+    /// `bytes` with `total` bytes of ICC profile inserted after SOI as APP2
+    /// chunks of at most [`ICC_CHUNK_BYTES`] each.
+    fn with_icc_profile(bytes: &[u8], total: usize) -> Vec<u8> {
+        const CHUNK: usize = ICC_CHUNK_BYTES;
+        let chunks = total.div_ceil(CHUNK);
+        assert!(chunks <= 255, "an ICC profile has at most 255 chunks");
+        let mut out = bytes[..2].to_vec();
+        for index in 0..chunks {
+            let len = CHUNK.min(total - index * CHUNK);
+            out.extend_from_slice(&[0xff, 0xe2]);
+            out.extend_from_slice(&((2 + 14 + len) as u16).to_be_bytes());
+            out.extend_from_slice(b"ICC_PROFILE\0");
+            out.extend_from_slice(&[(index + 1) as u8, chunks as u8]);
+            out.resize(out.len() + len, 0x5a);
+        }
+        out.extend_from_slice(&bytes[2..]);
+        out
+    }
+
+    #[test]
+    fn jpeg_metadata_charge_follows_zune_jpegs_marker_contexts() {
+        let per_segment = JPEG_METADATA_SEGMENT_OVERHEAD_BYTES;
+        let mut bytes = vec![0xff, 0xd8];
+        // APP1 before the frame: 100-byte payload whose own bytes look like an
+        // APP2 marker. The payload is skipped, so that pattern is not counted.
+        bytes.extend_from_slice(&[0xff, 0xe1, 0x00, 102, 0xff, 0xe2, 0x00, 0x40]);
+        bytes.resize(bytes.len() + 96, 0);
+        // A DQT segment is skipped by its declared length too (14-byte payload).
+        bytes.extend_from_slice(&[0xff, 0xdb, 0x00, 16, 0xff, 0xef, 0x00, 10]);
+        bytes.resize(bytes.len() + 10, 0);
+        // A one-component SOS header, then entropy-coded bytes: a stuffed
+        // zero, a restart marker, and fill bytes are not metadata.
+        bytes.extend_from_slice(&[0xff, 0xda, 0x00, 8, 1, 1, 0, 0, 0x3f, 0]);
+        bytes.extend_from_slice(&[0x12, 0xff, 0x00, 0x34, 0xff, 0xd0, 0x56, 0xff, 0xff]);
+        // APP2 after the scan: 50-byte payload.
+        bytes.extend_from_slice(&[0xff, 0xe2, 0x00, 52]);
+        bytes.resize(bytes.len() + 50, 0);
+        // Between baseline scans a restart marker carries a length.
+        bytes.extend_from_slice(&[0xff, 0xd0, 0x00, 4, 0xaa, 0xbb]);
+        // COM: 10-byte payload.
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 12]);
+        bytes.resize(bytes.len() + 10, 0);
+        bytes.extend_from_slice(&[0xff, 0xd9]);
+        // Nothing after EOI is parsed.
+        bytes.extend_from_slice(&[0xff, 0xe1, 0x00, 102]);
+        bytes.resize(bytes.len() + 100, 0);
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&bytes),
+            2 * (100 + 50 + 10) + 3 * per_segment
+        );
+
+        // A declared length past the end of the input is charged only for the
+        // bytes that are actually there.
+        let truncated = [0xff, 0xd8, 0xff, 0xe2, 0x10, 0x00, 1, 2, 3, 4, 5];
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&truncated),
+            2 * 5 + per_segment
+        );
+    }
+
+    #[test]
+    fn header_markers_zune_jpeg_reads_with_a_length_cannot_hide_metadata() {
+        // zune-jpeg reads RST, SOI, and TEM before the first scan with a length
+        // and skips it, so an EOI or APP pattern inside one must neither end
+        // the walk nor make it jump over the profile that follows.
+        let mut icc = vec![0xff, 0xe2, 0x03, 0xea];
+        icc.resize(icc.len() + 1000, 0x5a);
+        for prefix in [
+            &[0xff, 0xd8, 0x00, 0x04, 0xff, 0xd9][..],
+            &[0xff, 0xd0, 0x00, 0x04, 0xff, 0xd9][..],
+            &[0xff, 0x01, 0x00, 0x04, 0xff, 0xd9][..],
+            &[0xff, 0xd0, 0x00, 0x06, 0xff, 0xe1, 0xff, 0xff][..],
+        ] {
+            let mut bytes = vec![0xff, 0xd8];
+            bytes.extend_from_slice(prefix);
+            bytes.extend_from_slice(&icc);
+            assert_eq!(
+                jpeg_retained_metadata_allocation(&bytes),
+                2 * 1000 + JPEG_METADATA_SEGMENT_OVERHEAD_BYTES,
+                "prefix {prefix:02x?}"
+            );
+        }
+    }
+
+    /// One 65,516-byte block that walks reading a length-6 APP0 as 6 bytes
+    /// see as a DQT, while zune-jpeg, which reads it as 7, parses the ICC chunk
+    /// inside: `FF E0 00 06 'ABCD'`, `FF DB`, then `FF E2 FF E0` and an ICC
+    /// chunk header followed by 65,488 bytes of profile.
+    fn app0_overread_icc_block(seq: u8, count: u8) -> Vec<u8> {
+        let mut block = vec![0xff, 0xe0, 0x00, 0x06, b'A', b'B', b'C', b'D', 0xff, 0xdb];
+        block.extend_from_slice(&[0xff, 0xe2, 0xff, 0xe0]);
+        block.extend_from_slice(b"ICC_PROFILE\0");
+        block.extend_from_slice(&[seq, count]);
+        block.resize(65_516, 0x5a);
+        block
+    }
+
+    #[test]
+    fn app0_with_length_six_is_read_one_byte_past_its_end() {
+        let per_segment = JPEG_METADATA_SEGMENT_OVERHEAD_BYTES;
+        // zune-jpeg consumes the FF of `FF D9` as the APP0's fifth probe byte,
+        // so that EOI is not a marker and the APP2 after it is parsed.
+        let mut bytes = vec![
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x06, b'A', b'B', b'C', b'D', 0xff, 0xd9,
+        ];
+        bytes.extend_from_slice(&[0xff, 0xe2, 0x03, 0xea]);
+        bytes.resize(bytes.len() + 1000, 0x5a);
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&bytes),
+            2 * (4 + 1000) + 2 * per_segment
+        );
+
+        // The same over-read means a frame header placed right after such an
+        // APP0 is not one zune-jpeg sees; the projection must not trust it.
+        let mut hidden = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x06, b'A', b'B', b'C', b'D'];
+        hidden.extend_from_slice(&jpeg_frame_and_first_scan(0xc0, &[(1, 1)], &[1])[2..]);
+        assert!(jpeg_frame_header(&hidden).is_none());
+
+        let block = app0_overread_icc_block(1, 1);
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&[&[0xff, 0xd8][..], &block].concat()),
+            2 * (4 + 65_502) + 2 * per_segment
+        );
+    }
+
+    #[tokio::test]
+    async fn app0_overread_cannot_hide_a_profile_from_admission() {
+        // The ordinary 3840x2160 photo behind 255 such blocks: ~15.9 MiB of
+        // profile that zune-jpeg keeps for the whole decode. Walks reading the
+        // APP0 as 6 bytes saw only DQTs and charged the photo as ordinary,
+        // under the cap. Aligned with zune-jpeg, the metadata walk charges the
+        // profile, and the frame walk meets the byte zune-jpeg treats as junk
+        // and takes the malformed-header fallback.
+        let photo = encoded_jpeg(3840, 2160);
+        let mut bytes = photo[..2].to_vec();
+        for seq in 1..=255u8 {
+            bytes.extend_from_slice(&app0_overread_icc_block(seq, 255));
+        }
+        bytes.extend_from_slice(&photo[2..]);
+
+        assert!(jpeg_retained_metadata_allocation(&bytes) >= 2 * 255 * 65_488);
+        assert!(jpeg_frame_header(&bytes).is_none());
+        let projected = projected_allocation("app0.jpg", "image/jpeg", &bytes).unwrap();
+        assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("app0.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("the hidden profile takes the frame over the per-image cap")
+        })
+        .await;
+        assert!(matches!(
+            multimodal_error_kind(&error),
+            "image_too_large" | "corrupt_image"
+        ));
+        assert_eq!(decodes, 0);
+    }
+
+    #[test]
+    fn restart_markers_between_scans_follow_the_frame_type() {
+        // After a scan, an APP2 (30-byte payload), then a restart marker whose
+        // next bytes look like an APP1 header with a 20-byte payload. zune-jpeg's
+        // progressive marker loop handles that RST without a length and would
+        // parse the APP1; its baseline loop reads FF E1 as the RST's length and
+        // skips it. This checks the walk's model of each loop; the synthetic
+        // scan data is not decodable.
+        let stream = |sof: u8| {
+            let mut bytes = jpeg_sof_header(16, 16, &[(1, 1)]);
+            bytes[3] = sof;
+            bytes.extend_from_slice(&[0xff, 0xda, 0x00, 8, 1, 1, 0, 0, 0x3f, 0, 0x12, 0x34]);
+            bytes.extend_from_slice(&[0xff, 0xe2, 0x00, 32]);
+            bytes.resize(bytes.len() + 30, 0);
+            bytes.extend_from_slice(&[0xff, 0xd0, 0xff, 0xe1, 0x00, 22]);
+            bytes.resize(bytes.len() + 20, 0);
+            bytes.extend_from_slice(&[0xff, 0xd9]);
+            bytes
+        };
+        let per_segment = JPEG_METADATA_SEGMENT_OVERHEAD_BYTES;
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&stream(0xc2)),
+            2 * (30 + 20) + 2 * per_segment
+        );
+        assert_eq!(
+            jpeg_retained_metadata_allocation(&stream(0xc0)),
+            2 * 30 + per_segment
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_heavy_baseline_photo_is_refused_before_decode() {
+        // The ordinary 3840x2160 photo with the largest ICC profile JPEG can
+        // carry (255 full chunks, ~15.9 MiB). Output plus both input copies
+        // fit under the cap, but the decoder also keeps the profile for the
+        // whole decode, which takes the real peak over it.
+        const ICC_BYTES: usize = 255 * ICC_CHUNK_BYTES;
+        let photo = encoded_jpeg(3840, 2160);
+        let bytes = with_icc_profile(&photo, ICC_BYTES);
+        let header = jpeg_frame_header(&bytes).expect("encoded JPEG has a frame header");
+        assert!(header.first_scan_decodes_rows);
+
+        let metadata = jpeg_retained_metadata_allocation(&bytes);
+        assert!(metadata >= 2 * ICC_BYTES as u64);
+        let projected = projected_allocation("icc.jpg", "image/jpeg", &bytes).unwrap();
+        assert!(projected - metadata < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("icc.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("retained metadata takes the frame over the per-image cap")
+        })
+        .await;
+        assert!(matches!(
+            multimodal_error_kind(&error),
+            "image_too_large" | "corrupt_image"
+        ));
+        assert_eq!(decodes, 0);
+    }
+
     #[test]
     fn second_frame_header_before_first_scan_uses_the_malformed_fallback() {
-        // zune-jpeg parses every frame header it reaches, so a progressive SOF
-        // after a baseline one would switch the decode to progressive.
+        // A progressive SOF after a baseline one leaves the frame type
+        // ambiguous; zune-jpeg rejects the stream, and the projection does not
+        // classify it.
         let mut bytes = jpeg_sof_header(17, 9, &SAMPLING_420);
         bytes.extend_from_slice(&jpeg_frame_and_first_scan(0xc2, &SAMPLING_420, &[1, 2, 3])[2..]);
         assert!(jpeg_frame_header(&bytes).is_none());
@@ -6187,9 +6524,10 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_jpeg_sof_marker_cannot_undercharge_admission() {
-        // Large enough that the real frame's output alone exceeds the cap: the
-        // encoded first scan covers every component, so no coefficient planes
-        // are charged.
+        // The encoded first scan covers every component, so the real frame is
+        // charged row scratch rather than coefficient planes. What this pins is
+        // that the projection reads the real three-component frame; refusal at
+        // 5000x5000 follows from the output buffer alone.
         let mut bytes = jpeg_with_declared_dimensions(5000, 5000);
         // zune-jpeg 0.5.15 treats C3 as an unknown length-bearing marker and
         // continues to the real three-component frame header. The projection
