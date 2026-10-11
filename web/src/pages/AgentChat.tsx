@@ -467,6 +467,10 @@ export function AgentChatInner({
   // in-flight turn, the WS handler sends an `error` frame which our
   // onMessage handler already maps to typing=false.
   const handleAbort = useCallback(async () => {
+    // The Stop button unmounts when the turn ends, taking focus with it, so
+    // hand focus to the input now. Waiting for the abort request would take
+    // focus back from any control the user moves to while it is pending.
+    inputRef.current?.focus();
     try {
       await abortSession();
     } catch {
@@ -474,8 +478,6 @@ export function AgentChatInner({
       // user can retry, and any leaked typing state clears on the next
       // server frame.
     }
-    // The Stop button unmounts when the turn ends, taking focus with it.
-    inputRef.current?.focus();
   }, [abortSession]);
 
   const toggleCompact = useCallback(() => {

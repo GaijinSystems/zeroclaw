@@ -69,6 +69,10 @@ let configPutCalls: ConfigPutRequest[] = [];
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
+// Lets a test hold the Stop button's abort request open.
+let abortHandler: (() => Promise<Response>) | null = null;
+// Counts focus() calls on the mounted chat textarea.
+let textareaFocusCalls = 0;
 
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
@@ -90,6 +94,10 @@ globalThis.fetch = async (input, init) => {
     // `sessionsResponder` lets a test control when each listing resolves, so
     // out-of-order list responses can be reproduced deterministically.
     body = { sessions: sessionsResponder ? await sessionsResponder() : listedSessions };
+  }
+  else if (/\/api\/sessions\/[^/]+\/abort$/.test(url) && init?.method === 'POST') {
+    if (abortHandler) return abortHandler();
+    body = { status: 'aborted' };
   }
   else if (/\/api\/sessions\/[^/]+$/.test(url) && init?.method === 'DELETE') {
     // The gateway's real DELETE contract: a plain `{"error": ...}` body, not
@@ -287,7 +295,7 @@ async function mountChat(
       ),
       {
         createNodeMock: (element) => element.type === 'textarea'
-          ? { style: {}, focus: () => {}, scrollHeight: 24 }
+          ? { style: {}, focus: () => { textareaFocusCalls += 1; }, scrollHeight: 24 }
           : { focus: () => {}, scrollIntoView: () => {}, contains: () => false },
       },
     );
@@ -351,6 +359,8 @@ beforeEach(() => {
   missingSessions = new Set();
   deleteFailures = new Set();
   configPutHandler = null;
+  abortHandler = null;
+  textareaFocusCalls = 0;
   sessionsResponder = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
@@ -557,6 +567,47 @@ test('the composer stays focusable and read-only during a turn and sends nothing
   });
   await settle();
   assert.equal(textarea(mounted.renderer).props.readOnly, false);
+  await unmount(mounted.renderer);
+});
+
+test('Stop hands focus to the composer at once and not again when the abort settles', async () => {
+  const abort = new Deferred<Response>();
+  abortHandler = () => abort.promise;
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await typeInComposer(mounted.renderer, 'long question');
+  await act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Enter',
+      shiftKey: false,
+      nativeEvent: { isComposing: false },
+      preventDefault: () => {},
+    });
+  });
+  const stop = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Stop');
+  assert.ok(stop);
+
+  textareaFocusCalls = 0;
+  let pending!: Promise<void>;
+  await act(async () => { pending = stop.props.onClick(); });
+  assert.equal(textareaFocusCalls, 1, 'Stop focuses the composer before the abort request settles');
+
+  // The user may focus another control while the request is pending; settling
+  // it must not take focus back.
+  await act(async () => {
+    abort.resolve(new Response('{"status":"aborted"}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    await pending;
+  });
+  await settle();
+  assert.equal(textareaFocusCalls, 1, 'a settled abort does not refocus the composer');
   await unmount(mounted.renderer);
 });
 
