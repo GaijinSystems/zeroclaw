@@ -637,7 +637,7 @@ export function AgentChatInner({
 
       {/* Chat toolbar */}
       {messages.length > 0 && (
-        <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
           <Button
             variant="ghost"
             size="sm"
